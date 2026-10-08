@@ -1,0 +1,183 @@
+#!/bin/bash
+# phone-preview: let your phone reach a local dev server for a limited time.
+#
+# Opens the port in ufw for the current LAN subnet only, runs the server, shows
+# the URL as a QR code, and closes everything when the server stops, when you
+# press Ctrl+C, or when the time limit is reached. Requires arming first
+# (Super+Shift+Ctrl+P or `phone-preview --arm`); a reboot disarms.
+set -euo pipefail
+
+FW=/usr/local/sbin/phone-preview-fw
+ARM=/usr/local/sbin/phone-preview-arm
+ARMED=/run/phone-preview/armed
+HOTKEY="Super+Shift+Ctrl+P"
+
+usage() {
+  cat <<EOF
+Usage:
+  phone-preview [options] DIR            serve DIR as static files (python http.server)
+  phone-preview [options] -- CMD ...     run a dev server command, e.g. -- vite --host
+
+Options:
+  -p, --port PORT       port to open (default 8123); in command mode it must be
+                        the port CMD listens on (for vite: --port PORT --strictPort)
+  -m, --minutes N       close after N minutes (default 120, max 120)
+  -u, --url-path PATH   path appended to the printed URL, e.g. '/?variant=A'
+
+Other commands:
+  --toggle              arm if disarmed, disarm if armed (the hotkey runs this)
+  --arm                 arm until reboot (asks for fingerprint/password)
+  --disarm              disarm and close every phone-preview port
+  --status              show whether armed and which ports are open
+  --close [PORT]        close PORT, or every phone-preview port
+EOF
+}
+
+die() { echo "phone-preview: $*" >&2; exit 1; }
+notify() { notify-send -a "Phone preview" "$@" 2>/dev/null || true; }
+fw() {
+  [[ -x $FW ]] || die "root helpers not installed; run: sudo ./install.sh (in the phone-preview repo)"
+  sudo -n "$FW" "$@"
+}
+
+arm() {
+  if pkexec "$ARM" >/dev/null; then
+    notify "Phone preview armed" "Until reboot. Press $HOTKEY again to disarm."
+    echo "Armed until reboot."
+  else
+    notify "Phone preview not armed" "Authentication was cancelled."
+    die "not armed"
+  fi
+}
+
+disarm() {
+  fw disarm
+  notify "Phone preview disarmed" "All phone-preview ports are closed."
+  echo "Disarmed; all phone-preview ports closed."
+}
+
+port=8123 minutes=120 url_path=/ dir= action= close_port=
+cmd=()
+while (( $# )); do
+  case $1 in
+    -p|--port)     port=${2:?--port needs a value}; shift 2 ;;
+    -m|--minutes)  minutes=${2:?--minutes needs a value}; shift 2 ;;
+    -u|--url-path) url_path=${2:?--url-path needs a value}; shift 2 ;;
+    --toggle|--arm|--disarm|--status) action=${1#--}; shift ;;
+    --close)
+      action=close; shift
+      if [[ ${1:-} =~ ^[0-9]+$ ]]; then close_port=$1; shift; fi ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; cmd=("$@"); break ;;
+    -*)            die "unknown option $1 (see --help)" ;;
+    *)             [[ -z $dir ]] || die "only one DIR allowed"; dir=$1; shift ;;
+  esac
+done
+
+case $action in
+  toggle) if [[ -f $ARMED ]]; then disarm; else arm; fi; exit ;;
+  arm)    arm; exit ;;
+  disarm) disarm; exit ;;
+  status) fw status; exit ;;
+  close)  fw close ${close_port:+"$close_port"}; echo "Closed."; exit ;;
+esac
+
+[[ -n $dir && ${#cmd[@]} -gt 0 ]] && die "give either DIR or -- CMD, not both"
+[[ -z $dir && ${#cmd[@]} -eq 0 ]] && { usage >&2; exit 2; }
+[[ $port =~ ^[0-9]+$ ]] && (( port >= 1024 && port <= 65535 )) || die "port must be 1024-65535"
+[[ $minutes =~ ^[0-9]+$ ]] && (( minutes >= 1 && minutes <= 120 )) || die "minutes must be 1-120"
+[[ $url_path == /* ]] || url_path=/$url_path
+
+if [[ -n $dir ]]; then
+  dir=$(realpath -e -- "$dir") || die "no such directory"
+  [[ -d $dir ]] || die "$dir is not a directory"
+  [[ $dir != / && $dir != "$HOME" ]] || die "refusing to serve $dir"
+  # http.server serves everything under DIR and follows symlinks.
+  [[ -z $(find "$dir" -name .git -print -quit) ]] ||
+    die "refusing to serve $dir: it contains a .git (serve a subfolder instead)"
+  [[ -z $(find "$dir" -type l -print -quit) ]] ||
+    die "refusing to serve $dir: it contains symlinks, which could point outside it"
+  cmd=(python3 -m http.server "$port" -d "$dir")
+fi
+
+if ss -Hltn "sport = :$port" | grep -q .; then
+  die "port $port is already in use"
+fi
+[[ -f $ARMED ]] || die "not armed. Press $HOTKEY (or run: phone-preview --arm), then try again."
+
+opened=0 server_pid=
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  if [[ -n $server_pid ]] && kill -0 "$server_pid" 2>/dev/null; then
+    kill -TERM -- "-$server_pid" 2>/dev/null || true
+    for _ in {1..30}; do kill -0 "$server_pid" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL -- "-$server_pid" 2>/dev/null || true
+  fi
+  if (( opened )); then
+    if fw close "$port" >/dev/null; then
+      echo "Port $port closed."
+      notify "Phone preview closed" "Port $port is closed again."
+    else
+      echo "WARNING: could not close port $port. Run: phone-preview --close $port" >&2
+      notify -u critical "Phone preview: port $port may still be open" "Run: phone-preview --close $port"
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+set +e
+out=$(fw open "$port" "$minutes" 2>&1)
+rc=$?
+set -e
+case $rc in
+  0) opened=1
+     deadline=$(sed -n 's/^expires=//p' <<<"$out")
+     subnet=$(sed -n 's/^subnet=//p' <<<"$out") ;;
+  3) die "not armed. Press $HOTKEY (or run: phone-preview --arm), then try again." ;;
+  4) echo "Note: ufw is not active, so no firewall rule is needed."
+     deadline=$(( $(date +%s) + minutes * 60 )) subnet="any (no firewall)" ;;
+  *) [[ $out == *"password is required"* ]] && out="the sudoers rule is missing; run: sudo ./install.sh (in the phone-preview repo)"
+     die "$out" ;;
+esac
+
+# Own session/process group, so the whole server tree can be stopped at once.
+setsid "${cmd[@]}" <&0 &
+server_pid=$!
+
+dev=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+ip=$(ip -4 -o addr show dev "$dev" | awk '{ sub(/\/.*/, "", $4); print $4; exit }')
+url="http://$ip:$port$url_path"
+closes_at=$(date -d "@$deadline" '+%H:%M')
+
+echo
+command -v qrencode >/dev/null && qrencode -t ansiutf8 -m 1 "$url"
+echo "  Open on your phone:  $url"
+echo "  Allowed from:        $subnet"
+echo "  Closes at:           $closes_at (or when you press Ctrl+C)"
+echo
+notify "Phone preview open" "$url"$'\n'"Closes at $closes_at."
+
+warned=0
+while kill -0 "$server_pid" 2>/dev/null; do
+  now=$(date +%s)
+  if (( now >= deadline )); then
+    echo "Time limit reached; stopping."
+    exit 0
+  fi
+  if (( !warned && deadline - now <= 300 )); then
+    warned=1
+    notify "Phone preview closes in 5 minutes" "Port $port closes at $closes_at."
+  fi
+  sleep 2
+done
+set +e
+wait "$server_pid"
+rc=$?
+set -e
+echo "Server stopped (exit code $rc)."
+exit "$rc"

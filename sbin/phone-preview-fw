@@ -1,0 +1,143 @@
+#!/bin/bash
+# phone-preview-fw: the firewall half of phone-preview, and the only part that
+# runs as root without a password (via /etc/sudoers.d/phone-preview).
+#
+# It only ever touches ufw rules tagged "phone-preview", and `open` refuses
+# unless the feature has been armed with phone-preview-arm (which always asks
+# for authentication). The arm marker lives in /run, so a reboot disarms.
+#
+#   open PORT MINUTES   allow PORT/tcp from the current LAN subnet until expiry
+#   close [PORT]        delete tagged rules for PORT (all tagged rules if omitted)
+#   expire              delete tagged rules whose expiry has passed (timers call this)
+#   disarm              remove the arm marker and delete all tagged rules
+#   cleanup             delete all tagged rules (boot service calls this)
+#   status              print arm state and open rules
+#
+# Exit codes: 0 ok, 1 error, 2 usage, 3 not armed, 4 ufw not active.
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/sbin:/usr/bin
+umask 022
+
+TAG=phone-preview
+SELF=/usr/local/sbin/phone-preview-fw
+ARMED=/run/phone-preview/armed
+MAX_MINUTES=120
+
+die() { echo "phone-preview-fw: $1" >&2; exit "${2:-1}"; }
+
+[[ $EUID -eq 0 ]] || die "must be run as root: sudo $SELF ${*:-status}"
+
+# Serialize: ufw rule numbers shift when rules are deleted.
+exec 9>/run/lock/phone-preview-fw.lock
+flock -w 30 9 || die "timed out waiting for another phone-preview-fw"
+
+ufw_active() { ufw status | head -n1 | grep -q '^Status: active'; }
+
+# Prints "NUM EXPIRY PORT" for every tagged rule.
+list_rules() {
+  ufw status numbered |
+    sed -nE "s/^\[ *([0-9]+)\] +([0-9]+)\/tcp .*# $TAG exp=([0-9]+) *$/\1 \3 \2/p"
+}
+
+# delete_rules all | port:N | expired
+delete_rules() {
+  local filter=$1 now num exp port nums=()
+  now=$(date +%s)
+  while read -r num exp port; do
+    case $filter in
+      all) ;;
+      port:*) [[ $port == "${filter#port:}" ]] || continue ;;
+      expired) (( exp <= now )) || continue ;;
+    esac
+    nums+=("$num")
+  done < <(list_rules)
+  # Highest number first so the remaining numbers stay valid.
+  for num in $(printf '%s\n' "${nums[@]}" | sort -rn); do
+    ufw --force delete "$num" >/dev/null
+  done
+}
+
+stop_timers() {  # $1 = unit glob suffix
+  systemctl stop "phone-preview-expire-$1.timer" >/dev/null 2>&1 || true
+}
+
+valid_port() { [[ $1 =~ ^[0-9]{4,5}$ ]] && (( $1 >= 1024 && $1 <= 65535 )); }
+
+# Current LAN subnet, e.g. 192.168.1.0/24. Refuses anything that isn't a
+# private (RFC 1918) range of /16 or narrower.
+detect_subnet() {
+  local dev subnet a b prefix
+  dev=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+  [[ -n $dev ]] || die "no default route; not connected to a network?"
+  subnet=$(ip -4 route show dev "$dev" proto kernel scope link | awk 'NR == 1 { print $1 }')
+  [[ $subnet =~ ^([0-9]+)\.([0-9]+)\.[0-9]+\.[0-9]+/([0-9]+)$ ]] ||
+    die "could not determine the subnet of $dev"
+  a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} prefix=${BASH_REMATCH[3]}
+  if ! (( a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) )); then
+    die "$subnet on $dev is not a private LAN range; refusing"
+  fi
+  (( prefix >= 16 )) || die "$subnet is too broad (wider than /16); refusing"
+  echo "$subnet"
+}
+
+cmd_open() {
+  local port=${1:-} minutes=${2:-} subnet exp
+  valid_port "$port" || die "PORT must be 1024-65535" 2
+  [[ $minutes =~ ^[0-9]{1,3}$ ]] && (( minutes >= 1 && minutes <= MAX_MINUTES )) ||
+    die "MINUTES must be 1-$MAX_MINUTES" 2
+  [[ -f $ARMED ]] || die "not armed (run phone-preview-arm first)" 3
+  ufw_active || die "ufw is not active; no rule needed" 4
+
+  delete_rules expired
+  subnet=$(detect_subnet)
+  delete_rules "port:$port"
+  stop_timers "$port-*"
+
+  exp=$(( $(date +%s) + minutes * 60 ))
+  ufw allow from "$subnet" to any port "$port" proto tcp comment "$TAG exp=$exp" >/dev/null
+
+  # Independent deadline: fires even if the caller is killed. Wall-clock
+  # (OnCalendar), so time spent suspended counts toward the deadline.
+  if ! systemd-run --quiet --unit="phone-preview-expire-$port-$exp" \
+      --on-calendar="$(date -d "@$exp" '+%Y-%m-%d %H:%M:%S')" \
+      --timer-property=AccuracySec=1s "$SELF" expire; then
+    delete_rules "port:$port"
+    die "could not schedule the expiry timer; rule removed"
+  fi
+
+  echo "subnet=$subnet"
+  echo "expires=$exp"
+}
+
+cmd_close() {
+  local port=${1:-}
+  if [[ -z $port ]]; then
+    delete_rules all
+    stop_timers '*'
+  else
+    valid_port "$port" || die "PORT must be 1024-65535" 2
+    delete_rules "port:$port"
+    stop_timers "$port-*"
+  fi
+}
+
+cmd_status() {
+  local num exp port any=0
+  if [[ -f $ARMED ]]; then echo "armed: yes (until reboot or disarm)"; else echo "armed: no"; fi
+  if ufw_active; then echo "ufw: active"; else echo "ufw: not active"; fi
+  while read -r num exp port; do
+    any=1
+    echo "open: port $port/tcp, closes $(date -d "@$exp" '+%H:%M')"
+  done < <(list_rules)
+  (( any )) || echo "open: none"
+}
+
+case ${1:-} in
+  open)    shift; cmd_open "$@" ;;
+  close)   shift; cmd_close "$@" ;;
+  expire)  delete_rules expired ;;
+  disarm)  rm -f "$ARMED"; cmd_close ;;
+  cleanup) cmd_close ;;
+  status)  cmd_status ;;
+  *)       die "usage: $SELF open PORT MINUTES | close [PORT] | expire | disarm | cleanup | status" 2 ;;
+esac

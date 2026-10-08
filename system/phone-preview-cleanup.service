@@ -1,0 +1,10 @@
+[Unit]
+Description=Delete leftover phone-preview firewall rules after boot
+After=ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/phone-preview-fw cleanup
+
+[Install]
+WantedBy=multi-user.target

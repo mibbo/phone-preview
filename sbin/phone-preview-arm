@@ -1,0 +1,17 @@
+#!/bin/bash
+# phone-preview-arm: arms phone preview until the next reboot.
+#
+# Run through pkexec, so it always asks for authentication (fingerprint or
+# password). It takes no arguments; all it does is create a root-owned marker
+# in /run (RAM), which phone-preview-fw checks before opening a port.
+# Disarming needs no authentication: `sudo phone-preview-fw disarm`.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin
+
+[[ $EUID -eq 0 ]] || { echo "phone-preview-arm: run with pkexec" >&2; exit 1; }
+(( $# == 0 )) || { echo "phone-preview-arm: takes no arguments" >&2; exit 2; }
+
+install -d -m 0755 -o root -g root /run/phone-preview
+printf 'uid=%s\narmed_at=%s\n' "${PKEXEC_UID:-${SUDO_UID:-0}}" "$(date +%s)" >/run/phone-preview/armed
+chmod 0644 /run/phone-preview/armed
+echo armed
