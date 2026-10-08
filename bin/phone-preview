@@ -34,6 +34,10 @@ EOF
 }
 
 die() { echo "phone-preview: $*" >&2; exit 1; }
+# Options that take a value must not swallow the next option.
+need_value() {
+  [[ $# -ge 2 && $2 != -* ]] || die "$1 needs a value (see --help)"
+}
 notify() { notify-send -a "Phone preview" "$@" 2>/dev/null || true; }
 fw() {
   [[ -x $FW ]] || die "root helpers not installed; run: sudo ./install.sh (in the phone-preview repo)"
@@ -60,9 +64,13 @@ port=8123 minutes=120 url_path=/ dir= action= close_port=
 cmd=()
 while (( $# )); do
   case $1 in
-    -p|--port)     port=${2:?--port needs a value}; shift 2 ;;
-    -m|--minutes)  minutes=${2:?--minutes needs a value}; shift 2 ;;
-    -u|--url-path) url_path=${2:?--url-path needs a value}; shift 2 ;;
+    -p|--port)     need_value "$@"; port=$2; shift 2 ;;
+    -m|--minutes)  need_value "$@"; minutes=$2; shift 2 ;;
+    -u|--url-path)
+      need_value "$@"
+      [[ $2 == /* || $2 == '?'* ]] ||
+        die "-u needs a URL path starting with / or ?, e.g. -u '/?variant=A' (got '$2')"
+      url_path=$2; shift 2 ;;
     --toggle|--arm|--disarm|--status) action=${1#--}; shift ;;
     --close)
       action=close; shift
@@ -70,7 +78,7 @@ while (( $# )); do
     -h|--help)     usage; exit 0 ;;
     --)            shift; cmd=("$@"); break ;;
     -*)            die "unknown option $1 (see --help)" ;;
-    *)             [[ -z $dir ]] || die "only one DIR allowed"; dir=$1; shift ;;
+    *)             [[ -z $dir ]] || die "only one DIR allowed (got '$dir' and '$1')"; dir=$1; shift ;;
   esac
 done
 
