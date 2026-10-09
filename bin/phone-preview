@@ -172,6 +172,13 @@ notify "Phone preview open" "$url"$'\n'"Closes at $closes_at."
 
 warned=0
 while kill -0 "$server_pid" 2>/dev/null; do
+  # Disarming closes every port; stop too, instead of serving to nobody.
+  if [[ ! -f $ARMED ]]; then
+    opened=0
+    echo "Phone preview was disarmed (hotkey or --disarm); port closed, stopping."
+    notify "Phone preview stopped" "Disarmed, so the server on port $port was stopped too."
+    exit 0
+  fi
   now=$(date +%s)
   if (( now >= deadline )); then
     echo "Time limit reached; stopping."
